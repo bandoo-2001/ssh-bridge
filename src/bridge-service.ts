@@ -1,11 +1,20 @@
 import { randomUUID } from 'node:crypto';
-import type { Client, ClientChannel } from 'ssh2';
+import type { Client, ClientChannel, Stats, Attributes } from 'ssh2';
 import type { ServerConfig } from './config.js';
-import { OutputStore, type OutputRead } from './output-store.js';
+import { OutputStore } from './output-store.js';
 import { SshManager } from './ssh.js';
 
 type Execution = { conn: Client; channel?: ClientChannel; done: boolean; exitCode?: number | null; timer?: NodeJS.Timeout };
 type Terminal = { conn: Client; channel: ClientChannel };
+
+function typeOf(stats: Stats | Attributes) {
+  const mode = stats.mode ?? 0;
+  const kind = mode & 0o170000;
+  if (kind === 0o040000) return 'directory' as const;
+  if (kind === 0o100000) return 'file' as const;
+  if (kind === 0o120000) return 'symlink' as const;
+  return 'other' as const;
+}
 
 export class BridgeService {
   readonly executions = new Map<string, Execution>(); readonly terminals = new Map<string, Terminal>();
@@ -20,5 +29,31 @@ export class BridgeService {
   readTerminal(id: string, cursor = 0, maxBytes = 32 * 1024) { if (!this.terminals.has(id)) throw new Error('Unknown terminal'); return this.output.read(id, cursor, maxBytes); }
   writeTerminal(id: string, data: string) { const terminal = this.terminals.get(id); if (!terminal) throw new Error('Unknown terminal'); terminal.channel.write(data); return { written: true }; }
   closeTerminal(id: string) { const terminal = this.terminals.get(id); if (!terminal) throw new Error('Unknown terminal'); terminal.channel.close(); terminal.conn.end(); this.terminals.delete(id); this.output.clear(id); return { closed: true }; }
+  async statFile(id: string, path: string) {
+    const conn = await this.ssh.connect(this.server(id));
+    try {
+      const sftp = await this.ssh.sftp(conn); const stats = await this.ssh.stat(sftp, path);
+      return { path, type: typeOf(stats), size: stats.size, mode: stats.mode, uid: stats.uid, gid: stats.gid, atime: new Date(stats.atime * 1000).toISOString(), mtime: new Date(stats.mtime * 1000).toISOString() };
+    } finally { conn.end(); }
+  }
+  async listFiles(id: string, path: string) {
+    const conn = await this.ssh.connect(this.server(id));
+    try {
+      const sftp = await this.ssh.sftp(conn); const list = await this.ssh.readdir(sftp, path);
+      return list.map((item) => ({ name: item.filename, longname: item.longname, type: typeOf(item.attrs), size: item.attrs.size, mode: item.attrs.mode, uid: item.attrs.uid, gid: item.attrs.gid, atime: new Date(item.attrs.atime * 1000).toISOString(), mtime: new Date(item.attrs.mtime * 1000).toISOString() }));
+    } finally { conn.end(); }
+  }
+  async readFile(id: string, path: string, offset = 0, maxBytes = 1024 * 1024) {
+    if (offset < 0) throw new Error('offset must be >= 0');
+    if (maxBytes <= 0 || maxBytes > 1024 * 1024) throw new Error('maxBytes must be between 1 and 1048576');
+    const conn = await this.ssh.connect(this.server(id));
+    try {
+      const sftp = await this.ssh.sftp(conn); const stats = await this.ssh.stat(sftp, path);
+      if (!stats.isFile()) throw new Error('Path is not a file');
+      const { data, bytesRead } = await this.ssh.read(sftp, path, offset, maxBytes);
+      const nextOffset = offset + bytesRead;
+      return { path, offset, nextOffset, size: stats.size, hasMore: nextOffset < stats.size, encoding: 'base64' as const, data: data.toString('base64') };
+    } finally { conn.end(); }
+  }
   private server(id: string) { const server = this.config[id]; if (!server) throw new Error(`Unknown server: ${id}`); return server; }
 }
