@@ -1,0 +1,14 @@
+servers:
+  test-01:
+    name: 测试服务器
+    host: 127.0.0.1
+    port: 22
+    username: mcp-agent
+    privateKey: /absolute/path/to/private/key
+
+  password-server:
+    name: 密码认证服务器
+    host: 100.87.133.0
+    port: 22
+    username: bandoo
+    password: '@Bandoo2001'
