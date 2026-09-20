@@ -16,6 +16,27 @@ function typeOf(stats: Stats | Attributes) {
   return 'other' as const;
 }
 
+// Bound image payloads independently from the existing 1 MiB base64 page size.
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function imageMimeType(data: Buffer) {
+  if (data.length >= 33 && data.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) {
+    return 'image/png' as const;
+  }
+  if (data.length >= 4 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'image/jpeg' as const;
+  }
+  const signature = data.subarray(0, 6).toString('ascii');
+  if (data.length >= 13 && (signature === 'GIF87a' || signature === 'GIF89a')) {
+    return 'image/gif' as const;
+  }
+  if (data.length >= 16 && data.subarray(0, 4).toString('ascii') === 'RIFF'
+      && data.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp' as const;
+  }
+  throw new Error('Unsupported image content; supported formats: PNG, JPEG, GIF, WebP');
+}
+
 export class BridgeService {
   readonly executions = new Map<string, Execution>(); readonly terminals = new Map<string, Terminal>();
   constructor(private readonly config: Record<string, ServerConfig>, private readonly ssh = new SshManager(), private readonly output = new OutputStore()) {}
@@ -54,6 +75,16 @@ export class BridgeService {
       const nextOffset = offset + bytesRead;
       return { path, offset, nextOffset, size: stats.size, hasMore: nextOffset < stats.size, encoding: 'base64' as const, data: data.toString('base64') };
     } finally { conn.end(); }
+  }
+  async readImage(id: string, path: string) {
+    const conn = await this.ssh.connect(this.server(id));
+    try {
+      const sftp = await this.ssh.sftp(conn);
+      const data = await this.ssh.readCompleteFile(sftp, path, MAX_IMAGE_BYTES);
+      return { path, size: data.length, mimeType: imageMimeType(data), data: data.toString('base64') };
+    } finally {
+      conn.end();
+    }
   }
   private server(id: string) { const server = this.config[id]; if (!server) throw new Error(`Unknown server: ${id}`); return server; }
 }

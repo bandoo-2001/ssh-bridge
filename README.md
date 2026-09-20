@@ -296,9 +296,66 @@ terminal.open
 terminal.read
 terminal.write
 terminal.close
+
+file.stat
+file.list
+file.read
 ```
 
 MCP 和 REST 共用 `BridgeService`，不会分别实现 SSH 业务逻辑。
+
+## SFTP 文件读取与图片返回
+
+`file.stat` 获取文件信息，`file.list` 列出目录，`file.read` 读取文件。MCP 文件读取支持两种模式：
+
+| 参数 | Base64 模式（默认） | 图片模式 |
+| --- | --- | --- |
+| `format` | `base64`，可省略 | `image` |
+| `server` / `path` | 服务器配置 ID / 远程文件路径 | 相同 |
+| `offset` | 起始字节偏移，默认 0 | 必须为 0，可省略 |
+| `maxBytes` | 每页字节数，默认和最大均为 1 MiB | 必须省略 |
+| 返回 | 原有 JSON 文本：Base64 数据及分页字段 | 文件元数据文本 + 原生 MCP `image` 内容块 |
+
+图片模式一次返回整张图片，文件大小最多 **5 MiB（5,242,880 字节）**。这是本服务的安全上限，并非对所有 MCP 客户端限制的说明。支持按文件头识别 PNG、JPEG、GIF、WebP，不依赖文件扩展名；不做图片解码、转码或压缩。
+
+图片请求示例（`tools/call` 的参数）：
+
+```json
+{
+  "name": "file.read",
+  "arguments": {
+    "server": "password-server",
+    "path": "/tmp/wechat.png",
+    "format": "image"
+  }
+}
+```
+
+图片数据直接放在 `content` 中的 `type: image` 项，携带 `mimeType` 和 Base64 `data`，不再把整张图片包进 `type: text` 的 JSON 中。文本项只包含路径、大小、MIME 类型，不重复图片数据。
+
+底层在同一 SFTP 文件句柄上循环读取，处理短读，并在结束前比较文件大小和修改时间。空文件、非普通文件、超限文件、提前 EOF、可检测到的读取期间变化会返回工具错误，句柄在退出前关闭。大小和修改时间检查不是文件快照，不能保证检测到所有同大小、同时间戳的并发覆写；截图应先保存完毕再读取。
+
+此功能负责读取已有图片，不负责截取远程桌面，不创建公网下载地址。客户端能否显示图片或作为模型视觉输入，仍需在实际客户端验证。
+
+原有 REST API 保持兼容，仍返回 JSON，不切换为图片响应：
+
+```text
+GET /api/files/stat?server=...&path=...
+GET /api/files?server=...&path=...
+GET /api/files/content?server=...&path=...&offset=0&maxBytes=1048576
+```
+
+更新后需重新构建、重启服务，并让 MCP 客户端重新发现 `file.read` 的参数定义。工具数量仍为 13 个，新增的是 `format` 参数，不是额外的工具。仅构建不会更新已运行进程；重启会丢失当前内存中的命令与终端会话。
+
+集成测试在本机回环地址创建临时 HTTP 服务和只包含合成文件的 SSH/SFTP 服务，不使用真实服务器密码，结束后关闭测试进程并删除临时配置：
+
+```text
+npm test
+npm run build
+SSH_BRIDGE_TEST_BUILT=1 npm test -- tests/mcp-image.test.ts
+```
+
+注意：现有 `MCP_AUTH_TOKEN` 保护 `/mcp`，并不自动保护 `/api/*`。本次改动没有改变认证策略；REST 接口仍应限制在可信网络或额外加上认证。
 
 ## Secure MCP Tunnel
 

@@ -57,7 +57,28 @@ function createServer() { const s = new McpServer({ name: 'ssh-bridge', version:
   s.registerTool('terminal.write', { description: '向 PTY 终端写入键盘输入或 Shell 命令。', inputSchema: { terminalId: z.string().describe('终端会话 ID'), data: z.string().describe('写入终端的文本内容') } }, async ({ terminalId, data }) => text(bridge.writeTerminal(terminalId, data)));
   s.registerTool('file.stat', { description: '通过 SFTP 获取远程文件或目录信息。', inputSchema: { server: z.string().describe('服务器配置 ID'), path: z.string().describe('远程路径') } }, async ({ server, path }) => text(await bridge.statFile(server, path)));
   s.registerTool('file.list', { description: '通过 SFTP 列出远程目录内容。', inputSchema: { server: z.string().describe('服务器配置 ID'), path: z.string().describe('远程目录路径') } }, async ({ server, path }) => text(await bridge.listFiles(server, path)));
-  s.registerTool('file.read', { description: '通过 SFTP 分块读取远程文件，数据以 base64 返回。', inputSchema: { server: z.string().describe('服务器配置 ID'), path: z.string().describe('远程文件路径'), offset: z.number().int().nonnegative().default(0).describe('读取起始偏移'), maxBytes: z.number().int().positive().max(1048576).default(1048576).describe('本次最多读取字节数') } }, async ({ server, path, offset, maxBytes }) => text(await bridge.readFile(server, path, offset, maxBytes)));
+  s.registerTool('file.read', {
+    description: '通过 SFTP 读取远程文件。默认 format=base64 分块读取；查看图片时设置 format=image，返回完整 MCP 图片内容（PNG/JPEG/GIF/WebP，最大 5 MiB）。图片模式要求 offset=0，且不传 maxBytes。',
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: {
+      server: z.string().describe('服务器配置 ID'),
+      path: z.string().min(1).describe('远程文件路径'),
+      format: z.enum(['base64', 'image']).default('base64').describe('base64：保持原有分块读取；image：返回可供模型查看的完整图片'),
+      offset: z.number().int().nonnegative().default(0).describe('Base64 读取起始偏移；图片模式必须为 0'),
+      maxBytes: z.number().int().positive().max(1048576).optional().describe('仅 Base64 模式使用，默认 1 MiB；图片模式请省略')
+    }
+  }, async ({ server, path, format, offset, maxBytes }) => {
+    if (format === 'base64') return text(await bridge.readFile(server, path, offset, maxBytes));
+    if (offset !== 0) throw new Error('Image mode requires offset=0; partial images cannot be returned');
+    if (maxBytes !== undefined) throw new Error('Omit maxBytes in image mode; the entire image is read with a 5 MiB limit');
+    const { data, ...metadata } = await bridge.readImage(server, path);
+    return {
+      content: [
+        { type: 'text' as const, text: JSON.stringify(metadata) },
+        { type: 'image' as const, mimeType: metadata.mimeType, data }
+      ]
+    };
+  });
   s.registerTool('terminal.close', { description: '关闭 PTY 通道和对应 SSH 连接。', inputSchema: { terminalId: z.string().describe('终端会话 ID') } }, async ({ terminalId }) => text(bridge.closeTerminal(terminalId))); return s; }
 app.post('/mcp', async (request, reply) => { if (!authorized(request)) return reply.code(401).header('WWW-Authenticate', 'Bearer').send({ error: 'Unauthorized' }); const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true }); const server = createServer(); reply.raw.on('close', () => { void transport.close(); void server.close(); }); await server.connect(transport); await transport.handleRequest(request.raw, reply.raw, request.body); });
 for (const method of ['get', 'delete'] as const) app[method]('/mcp', async (_r, reply) => reply.code(405).send({ error: 'MCP endpoint accepts POST only' }));
